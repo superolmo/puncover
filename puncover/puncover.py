@@ -34,10 +34,10 @@ def get_default_port():
     return DEFAULT_PORT if not is_port_in_use(DEFAULT_PORT) else DEFAULT_PORT_FALLBACK
 
 
-def create_builder(gcc_base_filename, elf_file=None, su_dir=None, src_root=None):
+def create_builder(gcc_base_filename, elf_files=None, su_dir=None, src_root=None):
     c = Collector(GCCTools(gcc_base_filename))
-    if elf_file:
-        return ElfBuilder(c, src_root, elf_file, su_dir)
+    if elf_files:
+        return ElfBuilder(c, src_root, elf_files, su_dir)
     else:
         raise Exception("Unable to configure builder for collector")
 
@@ -82,13 +82,14 @@ def main():
         help="filename prefix for your gcc tools, e.g. ~/arm-cs-tools/bin/arm-none-eabi-",
     )
     parser.add_argument(
-        "elf_file", nargs="?", help="location of an ELF file (positional or --elf_file)"
+        "elf_file", nargs="*", help="location of one or more ELF files (positional or --elf_file)"
     )
     parser.add_argument(
         "--elf",
         "--elf_file",
         dest="elf_file_opt",
-        help="location of an ELF file (positional or --elf_file)",
+        action="append",
+        help="location of an ELF file (can be used multiple times)",
     )
     parser.add_argument("--src_root", "--src-root", help="location of your sources")
     parser.add_argument("--build_dir", "--build-dir", help="location of your build output")
@@ -107,10 +108,10 @@ def main():
     parser.add_argument("--version", action="version", version="%(prog)s " + version)
     args = parser.parse_args()
 
-    # Determine ELF file from positional or optional argument
-    elf_file = args.elf_file_opt if args.elf_file_opt else args.elf_file
-    if not elf_file:
-        parser.error("the following arguments are required: elf_file (positional or --elf_file)")
+    # Combine ELF files from positional and optional arguments
+    elf_files = args.elf_file + (args.elf_file_opt or [])
+    if not elf_files:
+        parser.error("at least one ELF file is required")
 
     if args.gcc_tools_base is None:
         print(
@@ -119,7 +120,7 @@ def main():
         exit(1)
 
     builder = create_builder(
-        args.gcc_tools_base, elf_file=elf_file, src_root=args.src_root, su_dir=args.build_dir
+        args.gcc_tools_base, elf_files=elf_files, src_root=args.src_root, su_dir=args.build_dir
     )
     builder.build_if_needed()
     renderers.register_jinja_filters(app.jinja_env)
