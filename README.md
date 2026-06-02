@@ -7,6 +7,8 @@
 
 # puncover
 
+![puncover logo](images/puncover-logo.png)
+
 ![](https://raw.githubusercontent.com/HBehrens/puncover/master/images/overview.png)
 
 Analyzes C/C++ binaries for code size, static variables and stack usages. It
@@ -36,6 +38,25 @@ You can also use `uvx` to run the script without installing globally:
 ```bash
 uvx puncover project.elf
 ```
+
+### Analysing stack usage
+
+In order to evaluate the stack usage of function and call trees, it is necessary to build with the `-fstack-usage` flag.
+
+This tells GCC to generate stack usage files (.su) for each compilation unit.
+
+For puncover to evaluate these .su files the `--build_dir` option needs to point to the build folder of the firmware.
+
+### Report export and non-interactive usage
+
+To monitor firmware changes in CI it can be useful to run puncover and save a
+JSON report.
+
+To generate a report add these flags
+`--generate-report --non-interactive --report-type json` and for a
+distinguishing entry to save more than one report in one file also add a report
+tag `--report-tag $COMMIT_FEATURE`. The report is saved under this tag as an
+object entry.
 
 ## Running Tests Locally
 
@@ -112,7 +133,6 @@ Only for reference, the release script should take care of all of this.
    ```
 
 7. Create GitHub releases:
-
    - `gh release create --generate-notes x.y.z`
    - attach the artifacts to the release too: `gh release upload x.y.z dist/*`
 

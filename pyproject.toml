@@ -1,16 +1,17 @@
 [project]
 name = "puncover"
 description = "Analyses C/C++ build output for code size, static variables, and stack usage."
-version = "0.7.1"
+version = "0.8.0"
 authors = [
     { name = "Hendrik Behrens", email = "hendrik.behrens@gmail.com" }
 ]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 dependencies = [
+    "configargparse[yaml]>=1.7.1",
     "Flask==2.2.5",
     "jinja2==3.1.6",
-    "werkzeug==3.0.6"
+    "werkzeug==3.1.5"
 ]
 dynamic = ["classifiers"]
 
@@ -27,6 +28,7 @@ dev = [
     "tox==4.11.3; python_version >= '3.12'",
     "setuptools>=75",
     "ruff>=0.12.10",
+    "pydantic>=2.13.3",
 ]
 
 [project.urls]

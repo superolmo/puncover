@@ -35,10 +35,17 @@ COLLAPSED_SUB_FOLDERS = "collapsed_sub_folders"
 CALLEES = "callees"
 CALLERS = "callers"
 
+CALLS_FLOAT_FUNCTION = "calls_float_function"
+PERFORMS_INDIRECT_CALL = "performs_indirect_call"
+UNRESOLVED_CALLS_IN_CALL_TREE = "unresolved_calls_in_call_tree"
+MISSING_STACKSIZE_IN_CALL_TREE = "missing_stacksize_in_call_tree"
+UNBOUND_STACKSIZE_IN_CALL_TREE = "unbound_stacksize_in_call_tree"
+
 DEEPEST_CALLEE_TREE = "deepest_callee_tree"
 DEEPEST_CALLER_TREE = "deepest_caller_tree"
 
 PYTHON_VER = {"major": sys.version_info[0], "minor": sys.version_info[1]}
+SUPPORTED_REPORT_TYPES = ["json"]
 
 
 def warning(*objs):
@@ -73,6 +80,8 @@ class StubGccTool:
         re.IGNORECASE,
     )
 
+    indirect_call_pattern = None
+
 
 class Collector:
     def __init__(self, gcc_tools):
@@ -85,6 +94,7 @@ class Collector:
         self.file_elements = {}
         self.symbols_by_qualified_name = None
         self.symbols_by_name = None
+        self.user_defined_stack_report = None
 
     def reset(self):
         self.symbols = {}
@@ -177,9 +187,11 @@ class Collector:
         types = {
             "A": TYPE_FUNCTION,
             "T": TYPE_FUNCTION,
+            "W": TYPE_FUNCTION,
             "D": TYPE_VARIABLE,
             "B": TYPE_VARIABLE,
             "R": TYPE_VARIABLE,
+            "V": TYPE_VARIABLE,
         }
 
         self.add_symbol(
@@ -342,7 +354,15 @@ class Collector:
                 symbol[STACK_QUALIFIERS] = stack_qualifier
                 return True
 
-        warning("Couldn't find symbol for %s:%d:%s" % (base_file_name, line, symbol_name))
+        # when a i.e. a function is compiled into the object file, but unused
+        # then during the complilation it is mentioned in the .su file,
+        # later during linking the function may be optimized out and not get into the final .elf
+        # TODO this causes many warnings for fw optimizing during linking,
+        # as long as each function in the ELF gets a .su value maybe this does not need to
+        # generate a warning for symbols not in the ELF, which are mentioned here?
+        warning(
+            f"Couldn't find symbol for {base_file_name}:{line}:{symbol_name}) - may be optimized out?"
+        )
         return False
 
     windows_path_pattern = re.compile(r"^([a-zA-Z]+)(:)(\\)(.+)$")
@@ -436,7 +456,7 @@ class Collector:
                 if callee_file and caller_file and callee_file != caller_file:
                     callee["called_from_other_file"] = True
 
-    def enhance_call_tree_from_assembly_line(self, function, line):
+    def add_function_call_from_assembly_line(self, function, line):
         if "<" not in line:
             return False
 
@@ -449,6 +469,21 @@ class Collector:
                 return True
 
         return False
+
+    def annotate_indirect_call(self, function, line):
+        if self.gcc_tools.indirect_call_pattern is None:
+            return False
+
+        match = self.gcc_tools.indirect_call_pattern.match(line)
+        if match:
+            function[PERFORMS_INDIRECT_CALL] = True
+            return True
+
+        return False
+
+    def enhance_call_tree_from_assembly_line(self, function, line):
+        self.add_function_call_from_assembly_line(function, line)
+        self.annotate_indirect_call(function, line)
 
     def enhance_call_tree(self):
         for f in self.all_functions():
@@ -653,17 +688,17 @@ class Collector:
         float_functions = [f for f in self.all_functions() if is_float_function_name(f[NAME])]
         for f in self.all_functions():
             callees = f[CALLEES]
-            f["calls_float_function"] = any([ff in callees for ff in float_functions])
+            f[CALLS_FLOAT_FUNCTION] = any([ff in callees for ff in float_functions])
 
         for file in self.all_files():
-            file["calls_float_function"] = any([f["calls_float_function"] for f in file[FUNCTIONS]])
+            file[CALLS_FLOAT_FUNCTION] = any([f[CALLS_FLOAT_FUNCTION] for f in file[FUNCTIONS]])
 
         def folder_calls_float_function(folder):
-            result = any([f["calls_float_function"] for f in folder[FILES]])
+            result = any([f[CALLS_FLOAT_FUNCTION] for f in folder[FILES]])
             for sub_folder in folder[SUB_FOLDERS]:
                 if folder_calls_float_function(sub_folder):
                     result = True
-            folder["calls_float_function"] = result
+            folder[CALLS_FLOAT_FUNCTION] = result
             return result
 
         for folder in self.root_folders():
@@ -682,3 +717,135 @@ class Collector:
                 qualified_name = self.qualified_symbol_name(s)
                 if qualified_name:
                     self.symbols_by_qualified_name[qualified_name] = s
+
+    def report_max_static_stack_usages_from_function_names(
+        self, function_names_and_opt_max_stack, report_type
+    ):
+        if report_type not in SUPPORTED_REPORT_TYPES:
+            print(
+                f"ERROR - requested report type {report_type} not supported, select one of {SUPPORTED_REPORT_TYPES}"
+            )
+            return {}
+
+        # Parse "name" or "name:::limit" entries; use ::: to avoid confusion with C++ ::
+        function_names = []
+        function_max_stacks = {}
+        for entry in function_names_and_opt_max_stack or []:
+            if ":::" in entry:
+                fn_name, limit = entry.split(":::", 1)
+                try:
+                    parsed_limit = int(limit)
+                except ValueError:
+                    print(f"ERROR: stack limit for '{fn_name}' must be an integer, got '{limit}'")
+                    return {}
+                function_names.append(fn_name)
+                function_max_stacks[fn_name] = parsed_limit
+            else:
+                function_names.append(entry)
+                function_max_stacks[entry] = None
+
+        report_max_map = {}
+        for sym in self.symbols.values():
+            name = sym["display_name"]
+            if name not in function_names:
+                continue
+
+            base_stack_size = sym.get("stack_size", 0) or 0
+            max_callee_tree_stack_size = sym["deepest_callee_tree"][0]
+            max_caller_tree_stack_size = sym["deepest_caller_tree"][0]
+            # base_stack_size is counted in both callee and caller trees, so subtract once
+            max_static_stack_size = (
+                max_callee_tree_stack_size + max_caller_tree_stack_size - base_stack_size
+            )
+            # caller_tree[1] = [sym, caller, grandcaller, ...]; reverse for top-down order
+            # callee_tree[1] = [sym, callee, leaf, ...]; skip sym (already in reversed caller tree)
+            ordered = (
+                list(reversed(sym["deepest_caller_tree"][1])) + sym["deepest_callee_tree"][1][1:]
+            )
+            entry = {
+                "max_static_stack_size": max_static_stack_size,
+                "call_stack": [
+                    {
+                        "function": f["display_name"],
+                        "name": f["name"],
+                        "stack_size": f.get("stack_size", "???"),
+                    }
+                    for f in ordered
+                ],
+            }
+            if function_max_stacks.get(name) is not None:
+                entry["max_stack_size"] = function_max_stacks[name]
+
+            report_max_map[name] = entry
+
+        for function_name in function_names:
+            if function_name not in report_max_map:
+                print(f"WARNING: Couldn't find symbol '{function_name}' to report")
+
+        self.user_defined_stack_report = report_max_map
+        return report_max_map
+
+    def prepare_report_for_json_export(self, export_json_data):
+        fn_symbols = []
+        var_symbols = []
+        if not self.symbols_by_qualified_name:
+            self.build_symbol_name_index()
+        for full_path, sym in self.symbols_by_qualified_name.items():
+            # if we use the plain symbols there are circular references
+            # and memory explodes into 10's of GB's serializing it so make
+            # symbols non-circular before serializing them to the database
+            non_circular_sym = {}
+            for sym_ele in sym.keys():
+                if sym_ele in [
+                    "line",
+                    "type",
+                    "size",
+                    "called_from_other_file",
+                    "calls_float_function",
+                    "performs_indirect_call",  # TODO add for manual resolution
+                    "stack_size",
+                    "stack_qualifiers",
+                ]:
+                    non_circular_sym[sym_ele] = sym[sym_ele]
+                elif sym_ele == "name":
+                    # do not override display name if it came first
+                    if "name" not in non_circular_sym:
+                        non_circular_sym[sym_ele] = sym[sym_ele]
+                elif sym_ele == "address":
+                    non_circular_sym[sym_ele] = int(sym[sym_ele], 16)
+                elif sym_ele == "asm":
+                    non_circular_sym["disasm"] = sym[sym_ele]
+                elif sym_ele == "display_name":
+                    non_circular_sym["name"] = sym[sym_ele]
+                elif sym_ele == "file":
+                    # TODO why is /-root missing and handle windows paths...
+                    filepath = "/" + str(sym["file"]["path"])
+                    non_circular_sym[sym_ele] = filepath
+                elif sym_ele in ["callees"]:
+                    callexs = []
+                    for callex in sym[sym_ele]:
+                        from_addr = int(sym["address"], 16)
+                        to_addr = int(callex["address"], 16)
+                        call = {"from": from_addr, "to": to_addr, "dynamic": False}
+                        callexs += [call]
+                    non_circular_sym[sym_ele] = callexs
+                elif sym_ele in [
+                    "next_function",
+                    "prev_function",
+                    "path",
+                    "callers",
+                    "base_file",
+                    "deepest_callee_tree",
+                    "deepest_caller_tree",
+                ]:
+                    # todo nothing?
+                    pass
+                else:
+                    print("unknown key " + sym_ele)
+            # add flatten symbol to list
+            symbols = fn_symbols if non_circular_sym["type"] == "function" else var_symbols
+            non_circular_sym.pop("type")
+            symbols += [non_circular_sym]
+        # if file exist
+        export_json_data["functions"] = fn_symbols
+        export_json_data["variables"] = var_symbols

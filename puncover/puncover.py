@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 
-import argparse
+import datetime
 import importlib.metadata
+import json
 import os
 import webbrowser
 from os.path import dirname
 from shutil import which
 from threading import Timer
 
+import configargparse
 from flask import Flask
 
 from puncover import renderers
@@ -72,9 +74,14 @@ def open_browser(host, port):
 def main():
     gcc_tools_base = get_arm_tools_prefix_path()
 
-    parser = argparse.ArgumentParser(
+    parser = configargparse.ArgumentParser(
         description="Analyses C/C++ build output for code size, static variables, and stack usage.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        formatter_class=configargparse.ArgumentDefaultsHelpFormatter,
+        default_config_files=["./puncover_config.yaml"],
+        config_file_parser_class=configargparse.YAMLConfigFileParser,
+    )
+    parser.add_argument(
+        "-c", "--config", required=False, is_config_file=True, help="config file path"
     )
     parser.add_argument(
         "--gcc-tools-base",
@@ -106,8 +113,61 @@ def main():
     parser.add_argument(
         "--no-open-browser", action="store_true", help="don't automatically open a browser window"
     )
+    parser.add_argument(
+        "--non-interactive",
+        "--non_interactive",
+        action="store_true",
+        dest="non_interactive",
+        help="don't start the interactive website; exit after generating any requested reports",
+    )
+    parser.add_argument(
+        "--generate-report",
+        "--generate_report",
+        action="store_true",
+        help="generate a JSON report file",
+    )
+    parser.add_argument(
+        "--report-type",
+        "--report_type",
+        default="json",
+        help="report format (currently only 'json' is supported)",
+    )
+    parser.add_argument(
+        "--report-tag",
+        "--report_tag",
+        default="no_tag",
+        help="tag used as the key for this report entry in the output file",
+    )
+    parser.add_argument(
+        "--report-filename",
+        "--report_filename",
+        default="report",
+        help="output filename (without extension) for the generated report",
+    )
+    parser.add_argument(
+        "--report-max-static-stack-usage",
+        "--report_max_static_stack_usage",
+        action="append",
+        dest="report_max_static_stack_usage",
+        help=(
+            "function to include in the stack report; format: display_name or "
+            "display_name:::max_stack_size (e.g. led_thread or led_thread:::1024). "
+            "May be specified multiple times."
+        ),
+    )
     parser.add_argument("--version", action="version", version="%(prog)s " + version)
+    parser.add_argument(
+        "--report-schema",
+        action="store_true",
+        help="print the JSON schema for the report output and exit",
+    )
     args = parser.parse_args()
+
+    if args.report_schema:
+        from puncover.report_schema import generate_schema
+
+        print(json.dumps(generate_schema(), indent=2))
+        return
 
     # Combine ELF files from positional and optional arguments
     elf_files = args.elf_file + (args.elf_file_opt or [])
@@ -124,6 +184,29 @@ def main():
         args.gcc_tools_base, elf_files=elf_files, src_root=args.src_root, su_dir=args.build_dir
     )
     builder.build_if_needed()
+
+    if args.generate_report:
+        export_json = {}
+        if os.path.isfile(args.report_filename + ".json"):
+            with open(args.report_filename + ".json") as f:
+                export_json = json.load(f)
+
+        tag_data = {"timestamp": datetime.datetime.now().isoformat()}
+
+        if args.report_max_static_stack_usage:
+            tag_data["stack_report"] = (
+                builder.collector.report_max_static_stack_usages_from_function_names(
+                    args.report_max_static_stack_usage, args.report_type
+                )
+            )
+        builder.collector.prepare_report_for_json_export(tag_data)
+        export_json[args.report_tag] = tag_data
+        with open(args.report_filename + ".json", "w") as f:
+            json.dump(export_json, f, indent=4, ensure_ascii=False)
+
+    if args.non_interactive:
+        return
+
     renderers.register_jinja_filters(app.jinja_env)
     renderers.register_urls(app, builder.collector)
     app.wsgi_app = BuilderMiddleware(app.wsgi_app, builder)
